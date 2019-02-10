@@ -1,3 +1,5 @@
+// +build !confonly
+
 package socks
 
 import (
@@ -13,8 +15,8 @@ import (
 	"v2ray.com/core/common/session"
 	"v2ray.com/core/common/signal"
 	"v2ray.com/core/common/task"
-	"v2ray.com/core/common/vio"
 	"v2ray.com/core/features/policy"
+	"v2ray.com/core/transport"
 	"v2ray.com/core/transport/internet"
 )
 
@@ -46,7 +48,7 @@ func NewClient(ctx context.Context, config *ClientConfig) (*Client, error) {
 }
 
 // Process implements proxy.Outbound.Process.
-func (c *Client) Process(ctx context.Context, link *vio.Link, dialer internet.Dialer) error {
+func (c *Client) Process(ctx context.Context, link *transport.Link, dialer internet.Dialer) error {
 	outbound := session.OutboundFromContext(ctx)
 	if outbound == nil || !outbound.Target.IsValid() {
 		return newError("target not specified.")
@@ -137,8 +139,8 @@ func (c *Client) Process(ctx context.Context, link *vio.Link, dialer internet.Di
 		}
 	}
 
-	var responseDonePost = task.Single(responseFunc, task.OnSuccess(task.Close(link.Writer)))
-	if err := task.Run(task.WithContext(ctx), task.Parallel(requestFunc, responseDonePost))(); err != nil {
+	var responseDonePost = task.OnSuccess(responseFunc, task.Close(link.Writer))
+	if err := task.Run(ctx, requestFunc, responseDonePost); err != nil {
 		return newError("connection ends").Base(err)
 	}
 

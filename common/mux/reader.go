@@ -38,12 +38,12 @@ func (r *PacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	}
 
 	b := buf.New()
-	if err := b.Reset(buf.ReadFullFrom(r.reader, int32(size))); err != nil {
+	if _, err := b.ReadFullFrom(r.reader, int32(size)); err != nil {
 		b.Release()
 		return nil, err
 	}
 	r.eof = true
-	return buf.NewMultiBufferValue(b), nil
+	return buf.MultiBuffer{b}, nil
 }
 
 // NewStreamReader creates a new StreamReader.

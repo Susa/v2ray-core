@@ -1,3 +1,5 @@
+// +build !confonly
+
 package outbound
 
 //go:generate errorgen
@@ -16,10 +18,10 @@ import (
 	"v2ray.com/core/common/session"
 	"v2ray.com/core/common/signal"
 	"v2ray.com/core/common/task"
-	"v2ray.com/core/common/vio"
 	"v2ray.com/core/features/policy"
 	"v2ray.com/core/proxy/vmess"
 	"v2ray.com/core/proxy/vmess/encoding"
+	"v2ray.com/core/transport"
 	"v2ray.com/core/transport/internet"
 )
 
@@ -52,7 +54,7 @@ func New(ctx context.Context, config *Config) (*Handler, error) {
 }
 
 // Process implements proxy.Outbound.Process().
-func (v *Handler) Process(ctx context.Context, link *vio.Link, dialer internet.Dialer) error {
+func (v *Handler) Process(ctx context.Context, link *transport.Link, dialer internet.Dialer) error {
 	var rec *protocol.ServerSpec
 	var conn internet.Connection
 
@@ -103,7 +105,7 @@ func (v *Handler) Process(ctx context.Context, link *vio.Link, dialer internet.D
 		request.Option.Set(protocol.RequestOptionChunkMasking)
 	}
 
-	if enablePadding && request.Option.Has(protocol.RequestOptionChunkMasking) {
+	if shouldEnablePadding(request.Security) && request.Option.Has(protocol.RequestOptionChunkMasking) {
 		request.Option.Set(protocol.RequestOptionGlobalPadding)
 	}
 
@@ -161,8 +163,8 @@ func (v *Handler) Process(ctx context.Context, link *vio.Link, dialer internet.D
 		return buf.Copy(bodyReader, output, buf.UpdateActivity(timer))
 	}
 
-	var responseDonePost = task.Single(responseDone, task.OnSuccess(task.Close(output)))
-	if err := task.Run(task.WithContext(ctx), task.Parallel(requestDone, responseDonePost))(); err != nil {
+	var responseDonePost = task.OnSuccess(responseDone, task.Close(output))
+	if err := task.Run(ctx, requestDone, responseDonePost); err != nil {
 		return newError("connection ends").Base(err)
 	}
 
@@ -172,6 +174,10 @@ func (v *Handler) Process(ctx context.Context, link *vio.Link, dialer internet.D
 var (
 	enablePadding = false
 )
+
+func shouldEnablePadding(s protocol.SecurityType) bool {
+	return enablePadding || s == protocol.SecurityType_AES128_GCM || s == protocol.SecurityType_CHACHA20_POLY1305 || s == protocol.SecurityType_AUTO
+}
 
 func init() {
 	common.Must(common.RegisterConfig((*Config)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {

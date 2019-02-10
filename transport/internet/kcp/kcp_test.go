@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"v2ray.com/core/common"
 	"v2ray.com/core/common/net"
 	"v2ray.com/core/transport/internet"
 	. "v2ray.com/core/transport/internet/kcp"
@@ -17,11 +18,10 @@ import (
 func TestDialAndListen(t *testing.T) {
 	assert := With(t)
 
-	lctx := internet.ContextWithStreamSettings(context.Background(), &internet.MemoryStreamConfig{
+	listerner, err := NewListener(context.Background(), net.LocalHostIP, net.Port(0), &internet.MemoryStreamConfig{
 		ProtocolName:     "mkcp",
 		ProtocolSettings: &Config{},
-	})
-	listerner, err := NewListener(lctx, net.LocalHostIP, net.Port(0), func(conn internet.Connection) {
+	}, func(conn internet.Connection) {
 		go func(c internet.Connection) {
 			payload := make([]byte, 4096)
 			for {
@@ -37,17 +37,16 @@ func TestDialAndListen(t *testing.T) {
 			c.Close()
 		}(conn)
 	})
-	assert(err, IsNil)
+	common.Must(err)
 	port := net.Port(listerner.Addr().(*net.UDPAddr).Port)
 
-	ctx := internet.ContextWithStreamSettings(context.Background(), &internet.MemoryStreamConfig{
-		ProtocolName:     "mkcp",
-		ProtocolSettings: &Config{},
-	})
 	wg := new(sync.WaitGroup)
 	for i := 0; i < 10; i++ {
-		clientConn, err := DialKCP(ctx, net.UDPDestination(net.LocalHostIP, port))
-		assert(err, IsNil)
+		clientConn, err := DialKCP(context.Background(), net.UDPDestination(net.LocalHostIP, port), &internet.MemoryStreamConfig{
+			ProtocolName:     "mkcp",
+			ProtocolSettings: &Config{},
+		})
+		common.Must(err)
 		wg.Add(1)
 
 		go func() {

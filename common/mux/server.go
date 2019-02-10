@@ -5,14 +5,15 @@ import (
 	"io"
 
 	"v2ray.com/core"
+	"v2ray.com/core/common"
 	"v2ray.com/core/common/buf"
 	"v2ray.com/core/common/errors"
 	"v2ray.com/core/common/log"
 	"v2ray.com/core/common/net"
 	"v2ray.com/core/common/protocol"
 	"v2ray.com/core/common/session"
-	"v2ray.com/core/common/vio"
 	"v2ray.com/core/features/routing"
+	"v2ray.com/core/transport"
 	"v2ray.com/core/transport/pipe"
 )
 
@@ -35,7 +36,7 @@ func (s *Server) Type() interface{} {
 }
 
 // Dispatch impliments routing.Dispatcher
-func (s *Server) Dispatch(ctx context.Context, dest net.Destination) (*vio.Link, error) {
+func (s *Server) Dispatch(ctx context.Context, dest net.Destination) (*transport.Link, error) {
 	if dest.Address != muxCoolAddress {
 		return s.dispatcher.Dispatch(ctx, dest)
 	}
@@ -44,7 +45,7 @@ func (s *Server) Dispatch(ctx context.Context, dest net.Destination) (*vio.Link,
 	uplinkReader, uplinkWriter := pipe.New(opts...)
 	downlinkReader, downlinkWriter := pipe.New(opts...)
 
-	_, err := NewServerWorker(ctx, s.dispatcher, &vio.Link{
+	_, err := NewServerWorker(ctx, s.dispatcher, &transport.Link{
 		Reader: uplinkReader,
 		Writer: downlinkWriter,
 	})
@@ -52,7 +53,7 @@ func (s *Server) Dispatch(ctx context.Context, dest net.Destination) (*vio.Link,
 		return nil, err
 	}
 
-	return &vio.Link{Reader: downlinkReader, Writer: uplinkWriter}, nil
+	return &transport.Link{Reader: downlinkReader, Writer: uplinkWriter}, nil
 }
 
 // Start implements common.Runnable.
@@ -67,11 +68,11 @@ func (s *Server) Close() error {
 
 type ServerWorker struct {
 	dispatcher     routing.Dispatcher
-	link           *vio.Link
+	link           *transport.Link
 	sessionManager *SessionManager
 }
 
-func NewServerWorker(ctx context.Context, d routing.Dispatcher, link *vio.Link) (*ServerWorker, error) {
+func NewServerWorker(ctx context.Context, d routing.Dispatcher, link *transport.Link) (*ServerWorker, error) {
 	worker := &ServerWorker{
 		dispatcher:     d,
 		link:           link,
@@ -146,7 +147,7 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 	rr := s.NewReader(reader)
 	if err := buf.Copy(rr, s.output); err != nil {
 		buf.Copy(rr, buf.Discard)
-		pipe.CloseError(s.input)
+		common.Interrupt(s.input)
 		return s.Close()
 	}
 	return nil
@@ -159,6 +160,10 @@ func (w *ServerWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 
 	s, found := w.sessionManager.Get(meta.SessionID)
 	if !found {
+		// Notify remote peer to close this session.
+		closingWriter := NewResponseWriter(meta.SessionID, w.link.Writer, protocol.TransferTypeStream)
+		closingWriter.Close()
+
 		return buf.Copy(NewStreamReader(reader), buf.Discard)
 	}
 
@@ -166,10 +171,14 @@ func (w *ServerWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 	err := buf.Copy(rr, s.output)
 
 	if err != nil && buf.IsWriteError(err) {
-		newError("failed to write to downstream writer. closing session ", s.ID).Base(err)
+		newError("failed to write to downstream writer. closing session ", s.ID).Base(err).WriteToLog()
+
+		// Notify remote peer to close this session.
+		closingWriter := NewResponseWriter(meta.SessionID, w.link.Writer, protocol.TransferTypeStream)
+		closingWriter.Close()
 
 		drainErr := buf.Copy(rr, buf.Discard)
-		pipe.CloseError(s.input)
+		common.Interrupt(s.input)
 		s.Close()
 		return drainErr
 	}
@@ -180,8 +189,8 @@ func (w *ServerWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 func (w *ServerWorker) handleStatusEnd(meta *FrameMetadata, reader *buf.BufferedReader) error {
 	if s, found := w.sessionManager.Get(meta.SessionID); found {
 		if meta.Option.Has(OptionError) {
-			pipe.CloseError(s.input)
-			pipe.CloseError(s.output)
+			common.Interrupt(s.input)
+			common.Interrupt(s.output)
 		}
 		s.Close()
 	}
@@ -233,7 +242,7 @@ func (w *ServerWorker) run(ctx context.Context) {
 			if err != nil {
 				if errors.Cause(err) != io.EOF {
 					newError("unexpected EOF").Base(err).WriteToLog(session.ExportIDToError(ctx))
-					pipe.CloseError(input)
+					common.Interrupt(input)
 				}
 				return
 			}

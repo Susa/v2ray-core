@@ -20,12 +20,12 @@ func TestChunkStreamIO(t *testing.T) {
 	reader := NewChunkStreamReader(PlainChunkSizeParser{}, cache)
 
 	b := buf.New()
-	b.WriteBytes('a', 'b', 'c', 'd')
-	common.Must(writer.WriteMultiBuffer(buf.NewMultiBufferValue(b)))
+	b.WriteString("abcd")
+	common.Must(writer.WriteMultiBuffer(buf.MultiBuffer{b}))
 
 	b = buf.New()
-	b.WriteBytes('e', 'f', 'g')
-	common.Must(writer.WriteMultiBuffer(buf.NewMultiBufferValue(b)))
+	b.WriteString("efg")
+	common.Must(writer.WriteMultiBuffer(buf.MultiBuffer{b}))
 
 	common.Must(writer.WriteMultiBuffer(buf.MultiBuffer{}))
 
@@ -40,7 +40,7 @@ func TestChunkStreamIO(t *testing.T) {
 	assert(mb[0].Bytes(), Equals, []byte("abcd"))
 
 	mb, err = reader.ReadMultiBuffer()
-	assert(err, IsNil)
+	common.Must(err)
 	assert(mb.Len(), Equals, int32(3))
 	assert(mb[0].Bytes(), Equals, []byte("efg"))
 

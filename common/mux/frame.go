@@ -1,6 +1,7 @@
 package mux
 
 import (
+	"encoding/binary"
 	"io"
 
 	"v2ray.com/core/common"
@@ -60,22 +61,21 @@ type FrameMetadata struct {
 }
 
 func (f FrameMetadata) WriteTo(b *buf.Buffer) error {
-	lenBytes := b.Bytes()
-	common.Must2(b.WriteBytes(0x00, 0x00))
+	lenBytes := b.Extend(2)
 
 	len0 := b.Len()
-	if err := b.AppendSupplier(serial.WriteUint16(f.SessionID)); err != nil {
-		return err
-	}
+	sessionBytes := b.Extend(2)
+	binary.BigEndian.PutUint16(sessionBytes, f.SessionID)
 
-	common.Must2(b.WriteBytes(byte(f.SessionStatus), byte(f.Option)))
+	common.Must(b.WriteByte(byte(f.SessionStatus)))
+	common.Must(b.WriteByte(byte(f.Option)))
 
 	if f.SessionStatus == SessionStatusNew {
 		switch f.Target.Network {
 		case net.Network_TCP:
-			common.Must2(b.WriteBytes(byte(TargetNetworkTCP)))
+			common.Must(b.WriteByte(byte(TargetNetworkTCP)))
 		case net.Network_UDP:
-			common.Must2(b.WriteBytes(byte(TargetNetworkUDP)))
+			common.Must(b.WriteByte(byte(TargetNetworkUDP)))
 		}
 
 		if err := addrParser.WriteAddressPort(b, f.Target.Address, f.Target.Port); err != nil {
@@ -84,7 +84,7 @@ func (f FrameMetadata) WriteTo(b *buf.Buffer) error {
 	}
 
 	len1 := b.Len()
-	serial.Uint16ToBytes(uint16(len1-len0), lenBytes)
+	binary.BigEndian.PutUint16(lenBytes, uint16(len1-len0))
 	return nil
 }
 
@@ -101,7 +101,7 @@ func (f *FrameMetadata) Unmarshal(reader io.Reader) error {
 	b := buf.New()
 	defer b.Release()
 
-	if err := b.Reset(buf.ReadFullFrom(reader, int32(metaLen))); err != nil {
+	if _, err := b.ReadFullFrom(reader, int32(metaLen)); err != nil {
 		return err
 	}
 	return f.UnmarshalFromBuffer(b)
@@ -114,12 +114,15 @@ func (f *FrameMetadata) UnmarshalFromBuffer(b *buf.Buffer) error {
 		return newError("insufficient buffer: ", b.Len())
 	}
 
-	f.SessionID = serial.BytesToUint16(b.BytesTo(2))
+	f.SessionID = binary.BigEndian.Uint16(b.BytesTo(2))
 	f.SessionStatus = SessionStatus(b.Byte(2))
 	f.Option = bitmask.Byte(b.Byte(3))
 	f.Target.Network = net.Network_Unknown
 
 	if f.SessionStatus == SessionStatusNew {
+		if b.Len() < 8 {
+			return newError("insufficient buffer: ", b.Len())
+		}
 		network := TargetNetwork(b.Byte(4))
 		b.Advance(5)
 

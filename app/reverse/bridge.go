@@ -1,3 +1,5 @@
+// +build !confonly
+
 package reverse
 
 import (
@@ -9,11 +11,12 @@ import (
 	"v2ray.com/core/common/net"
 	"v2ray.com/core/common/session"
 	"v2ray.com/core/common/task"
-	"v2ray.com/core/common/vio"
 	"v2ray.com/core/features/routing"
+	"v2ray.com/core/transport"
 	"v2ray.com/core/transport/pipe"
 )
 
+// Bridge is a component in reverse proxy, that relays connections from Portal to local address.
 type Bridge struct {
 	dispatcher  routing.Dispatcher
 	tag         string
@@ -22,6 +25,7 @@ type Bridge struct {
 	monitorTask *task.Periodic
 }
 
+// NewBridge creates a new Bridge instance.
 func NewBridge(config *BridgeConfig, dispatcher routing.Dispatcher) (*Bridge, error) {
 	if len(config.Tag) == 0 {
 		return nil, newError("bridge tag is empty")
@@ -144,7 +148,7 @@ func (w *BridgeWorker) Connections() uint32 {
 	return w.worker.ActiveConnections()
 }
 
-func (w *BridgeWorker) handleInternalConn(link vio.Link) {
+func (w *BridgeWorker) handleInternalConn(link transport.Link) {
 	go func() {
 		reader := link.Reader
 		for {
@@ -166,7 +170,7 @@ func (w *BridgeWorker) handleInternalConn(link vio.Link) {
 	}()
 }
 
-func (w *BridgeWorker) Dispatch(ctx context.Context, dest net.Destination) (*vio.Link, error) {
+func (w *BridgeWorker) Dispatch(ctx context.Context, dest net.Destination) (*transport.Link, error) {
 	if !isInternalDomain(dest) {
 		ctx = session.ContextWithInbound(ctx, &session.Inbound{
 			Tag: w.tag,
@@ -178,12 +182,12 @@ func (w *BridgeWorker) Dispatch(ctx context.Context, dest net.Destination) (*vio
 	uplinkReader, uplinkWriter := pipe.New(opt...)
 	downlinkReader, downlinkWriter := pipe.New(opt...)
 
-	w.handleInternalConn(vio.Link{
+	w.handleInternalConn(transport.Link{
 		Reader: downlinkReader,
 		Writer: uplinkWriter,
 	})
 
-	return &vio.Link{
+	return &transport.Link{
 		Reader: uplinkReader,
 		Writer: downlinkWriter,
 	}, nil

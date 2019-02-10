@@ -1,3 +1,5 @@
+// +build !confonly
+
 package shadowsocks
 
 import (
@@ -12,8 +14,8 @@ import (
 	"v2ray.com/core/common/session"
 	"v2ray.com/core/common/signal"
 	"v2ray.com/core/common/task"
-	"v2ray.com/core/common/vio"
 	"v2ray.com/core/features/policy"
+	"v2ray.com/core/transport"
 	"v2ray.com/core/transport/internet"
 )
 
@@ -46,7 +48,7 @@ func NewClient(ctx context.Context, config *ClientConfig) (*Client, error) {
 }
 
 // Process implements OutboundHandler.Process().
-func (c *Client) Process(ctx context.Context, link *vio.Link, dialer internet.Dialer) error {
+func (c *Client) Process(ctx context.Context, link *transport.Link, dialer internet.Dialer) error {
 	outbound := session.OutboundFromContext(ctx)
 	if outbound == nil || !outbound.Target.IsValid() {
 		return newError("target not specified")
@@ -129,8 +131,8 @@ func (c *Client) Process(ctx context.Context, link *vio.Link, dialer internet.Di
 			return buf.Copy(responseReader, link.Writer, buf.UpdateActivity(timer))
 		}
 
-		var responseDoneAndCloseWriter = task.Single(responseDone, task.OnSuccess(task.Close(link.Writer)))
-		if err := task.Run(task.WithContext(ctx), task.Parallel(requestDone, responseDoneAndCloseWriter))(); err != nil {
+		var responseDoneAndCloseWriter = task.OnSuccess(responseDone, task.Close(link.Writer))
+		if err := task.Run(ctx, requestDone, responseDoneAndCloseWriter); err != nil {
 			return newError("connection ends").Base(err)
 		}
 
@@ -167,8 +169,8 @@ func (c *Client) Process(ctx context.Context, link *vio.Link, dialer internet.Di
 			return nil
 		}
 
-		var responseDoneAndCloseWriter = task.Single(responseDone, task.OnSuccess(task.Close(link.Writer)))
-		if err := task.Run(task.WithContext(ctx), task.Parallel(requestDone, responseDoneAndCloseWriter))(); err != nil {
+		var responseDoneAndCloseWriter = task.OnSuccess(responseDone, task.Close(link.Writer))
+		if err := task.Run(ctx, requestDone, responseDoneAndCloseWriter); err != nil {
 			return newError("connection ends").Base(err)
 		}
 

@@ -1,3 +1,5 @@
+// +build !confonly
+
 package reverse
 
 import (
@@ -12,8 +14,8 @@ import (
 	"v2ray.com/core/common/net"
 	"v2ray.com/core/common/session"
 	"v2ray.com/core/common/task"
-	"v2ray.com/core/common/vio"
 	"v2ray.com/core/features/outbound"
+	"v2ray.com/core/transport"
 	"v2ray.com/core/transport/pipe"
 )
 
@@ -61,13 +63,13 @@ func (p *Portal) Close() error {
 	return p.ohm.RemoveHandler(context.Background(), p.tag)
 }
 
-func (s *Portal) HandleConnection(ctx context.Context, link *vio.Link) error {
+func (p *Portal) HandleConnection(ctx context.Context, link *transport.Link) error {
 	outboundMeta := session.OutboundFromContext(ctx)
 	if outboundMeta == nil {
 		return newError("outbound metadata not found").AtError()
 	}
 
-	if isDomain(outboundMeta.Target, s.domain) {
+	if isDomain(outboundMeta.Target, p.domain) {
 		muxClient, err := mux.NewClientWorker(*link, mux.ClientStrategy{})
 		if err != nil {
 			return newError("failed to create mux client worker").Base(err).AtWarning()
@@ -78,11 +80,11 @@ func (s *Portal) HandleConnection(ctx context.Context, link *vio.Link) error {
 			return newError("failed to create portal worker").Base(err)
 		}
 
-		s.picker.AddWorker(worker)
+		p.picker.AddWorker(worker)
 		return nil
 	}
 
-	return s.client.Dispatch(ctx, link)
+	return p.client.Dispatch(ctx, link)
 }
 
 type Outbound struct {
@@ -94,10 +96,10 @@ func (o *Outbound) Tag() string {
 	return o.tag
 }
 
-func (o *Outbound) Dispatch(ctx context.Context, link *vio.Link) {
+func (o *Outbound) Dispatch(ctx context.Context, link *transport.Link) {
 	if err := o.portal.HandleConnection(ctx, link); err != nil {
 		newError("failed to process reverse connection").Base(err).WriteToLog(session.ExportIDToError(ctx))
-		pipe.CloseError(link.Writer)
+		common.Interrupt(link.Writer)
 	}
 }
 
@@ -206,7 +208,7 @@ func NewPortalWorker(client *mux.ClientWorker) (*PortalWorker, error) {
 	ctx = session.ContextWithOutbound(ctx, &session.Outbound{
 		Target: net.UDPDestination(net.DomainAddress(internalDomain), 0),
 	})
-	f := client.Dispatch(ctx, &vio.Link{
+	f := client.Dispatch(ctx, &transport.Link{
 		Reader: uplinkReader,
 		Writer: downlinkWriter,
 	})
@@ -244,15 +246,14 @@ func (w *PortalWorker) heartbeat() error {
 
 		defer func() {
 			common.Close(w.writer)
-			pipe.CloseError(w.reader)
+			common.Interrupt(w.reader)
 			w.writer = nil
 		}()
 	}
 
 	b, err := proto.Marshal(msg)
 	common.Must(err)
-	var mb buf.MultiBuffer
-	common.Must2(mb.Write(b))
+	mb := buf.MergeBytes(nil, b)
 	return w.writer.WriteMultiBuffer(mb)
 }
 

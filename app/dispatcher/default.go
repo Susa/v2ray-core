@@ -1,3 +1,5 @@
+// +build !confonly
+
 package dispatcher
 
 //go:generate errorgen
@@ -15,11 +17,11 @@ import (
 	"v2ray.com/core/common/net"
 	"v2ray.com/core/common/protocol"
 	"v2ray.com/core/common/session"
-	"v2ray.com/core/common/vio"
 	"v2ray.com/core/features/outbound"
 	"v2ray.com/core/features/policy"
 	"v2ray.com/core/features/routing"
 	"v2ray.com/core/features/stats"
+	"v2ray.com/core/transport"
 	"v2ray.com/core/transport/pipe"
 )
 
@@ -37,21 +39,31 @@ func (r *cachedReader) Cache(b *buf.Buffer) {
 	mb, _ := r.reader.ReadMultiBufferTimeout(time.Millisecond * 100)
 	r.Lock()
 	if !mb.IsEmpty() {
-		common.Must(r.cache.WriteMultiBuffer(mb))
+		r.cache, _ = buf.MergeMulti(r.cache, mb)
 	}
-	common.Must(b.Reset(func(x []byte) (int, error) {
-		return r.cache.Copy(x), nil
-	}))
+	b.Clear()
+	rawBytes := b.Extend(buf.Size)
+	n := r.cache.Copy(rawBytes)
+	b.Resize(0, int32(n))
 	r.Unlock()
 }
 
-func (r *cachedReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
+func (r *cachedReader) readInternal() buf.MultiBuffer {
 	r.Lock()
 	defer r.Unlock()
 
 	if r.cache != nil && !r.cache.IsEmpty() {
 		mb := r.cache
 		r.cache = nil
+		return mb
+	}
+
+	return nil
+}
+
+func (r *cachedReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
+	mb := r.readInternal()
+	if mb != nil {
 		return mb, nil
 	}
 
@@ -59,26 +71,21 @@ func (r *cachedReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 }
 
 func (r *cachedReader) ReadMultiBufferTimeout(timeout time.Duration) (buf.MultiBuffer, error) {
-	r.Lock()
-	defer r.Unlock()
-
-	if r.cache != nil && !r.cache.IsEmpty() {
-		mb := r.cache
-		r.cache = nil
+	mb := r.readInternal()
+	if mb != nil {
 		return mb, nil
 	}
 
 	return r.reader.ReadMultiBufferTimeout(timeout)
 }
 
-func (r *cachedReader) CloseError() {
+func (r *cachedReader) Interrupt() {
 	r.Lock()
 	if r.cache != nil {
-		r.cache.Release()
-		r.cache = nil
+		r.cache = buf.ReleaseMulti(r.cache)
 	}
 	r.Unlock()
-	r.reader.CloseError()
+	r.reader.Interrupt()
 }
 
 // DefaultDispatcher is a default implementation of Dispatcher.
@@ -123,17 +130,17 @@ func (*DefaultDispatcher) Start() error {
 // Close implements common.Closable.
 func (*DefaultDispatcher) Close() error { return nil }
 
-func (d *DefaultDispatcher) getLink(ctx context.Context) (*vio.Link, *vio.Link) {
+func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *transport.Link) {
 	opt := pipe.OptionsFromContext(ctx)
 	uplinkReader, uplinkWriter := pipe.New(opt...)
 	downlinkReader, downlinkWriter := pipe.New(opt...)
 
-	inboundLink := &vio.Link{
+	inboundLink := &transport.Link{
 		Reader: downlinkReader,
 		Writer: uplinkWriter,
 	}
 
-	outboundLink := &vio.Link{
+	outboundLink := &transport.Link{
 		Reader: uplinkReader,
 		Writer: downlinkWriter,
 	}
@@ -149,7 +156,7 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*vio.Link, *vio.Link) 
 		if p.Stats.UserUplink {
 			name := "user>>>" + user.Email + ">>>traffic>>>uplink"
 			if c, _ := stats.GetOrRegisterCounter(d.stats, name); c != nil {
-				inboundLink.Writer = &vio.SizeStatWriter{
+				inboundLink.Writer = &SizeStatWriter{
 					Counter: c,
 					Writer:  inboundLink.Writer,
 				}
@@ -158,7 +165,7 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*vio.Link, *vio.Link) 
 		if p.Stats.UserDownlink {
 			name := "user>>>" + user.Email + ">>>traffic>>>downlink"
 			if c, _ := stats.GetOrRegisterCounter(d.stats, name); c != nil {
-				outboundLink.Writer = &vio.SizeStatWriter{
+				outboundLink.Writer = &SizeStatWriter{
 					Counter: c,
 					Writer:  outboundLink.Writer,
 				}
@@ -179,7 +186,7 @@ func shouldOverride(result SniffResult, domainOverride []string) bool {
 }
 
 // Dispatch implements routing.Dispatcher.
-func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destination) (*vio.Link, error) {
+func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destination) (*transport.Link, error) {
 	if !destination.IsValid() {
 		panic("Dispatcher: Invalid destination.")
 	}
@@ -244,13 +251,13 @@ func sniffer(ctx context.Context, cReader *cachedReader) (SniffResult, error) {
 	}
 }
 
-func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *vio.Link, destination net.Destination) {
-	dispatcher := d.ohm.GetDefaultHandler()
+func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.Link, destination net.Destination) {
+	var handler outbound.Handler
 	if d.router != nil {
 		if tag, err := d.router.PickRoute(ctx); err == nil {
-			if handler := d.ohm.GetHandler(tag); handler != nil {
+			if h := d.ohm.GetHandler(tag); h != nil {
 				newError("taking detour [", tag, "] for [", destination, "]").WriteToLog(session.ExportIDToError(ctx))
-				dispatcher = handler
+				handler = h
 			} else {
 				newError("non existing tag: ", tag).AtWarning().WriteToLog(session.ExportIDToError(ctx))
 			}
@@ -258,5 +265,17 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *vio.Link, 
 			newError("default route for ", destination).WriteToLog(session.ExportIDToError(ctx))
 		}
 	}
-	dispatcher.Dispatch(ctx, link)
+
+	if handler == nil {
+		handler = d.ohm.GetDefaultHandler()
+	}
+
+	if handler == nil {
+		newError("default outbound handler not exist").WriteToLog(session.ExportIDToError(ctx))
+		common.Close(link.Writer)
+		common.Interrupt(link.Reader)
+		return
+	}
+
+	handler.Dispatch(ctx, link)
 }

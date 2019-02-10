@@ -9,9 +9,9 @@ import (
 	"v2ray.com/core/common/mux"
 	"v2ray.com/core/common/net"
 	"v2ray.com/core/common/session"
-	"v2ray.com/core/common/vio"
 	"v2ray.com/core/features/outbound"
 	"v2ray.com/core/proxy"
+	"v2ray.com/core/transport"
 	"v2ray.com/core/transport/internet"
 	"v2ray.com/core/transport/pipe"
 )
@@ -96,22 +96,30 @@ func (h *Handler) Tag() string {
 }
 
 // Dispatch implements proxy.Outbound.Dispatch.
-func (h *Handler) Dispatch(ctx context.Context, link *vio.Link) {
+func (h *Handler) Dispatch(ctx context.Context, link *transport.Link) {
 	if h.mux != nil {
 		if err := h.mux.Dispatch(ctx, link); err != nil {
 			newError("failed to process mux outbound traffic").Base(err).WriteToLog(session.ExportIDToError(ctx))
-			pipe.CloseError(link.Writer)
+			common.Interrupt(link.Writer)
 		}
 	} else {
 		if err := h.proxy.Process(ctx, link, h); err != nil {
 			// Ensure outbound ray is properly closed.
 			newError("failed to process outbound traffic").Base(err).WriteToLog(session.ExportIDToError(ctx))
-			pipe.CloseError(link.Writer)
+			common.Interrupt(link.Writer)
 		} else {
 			common.Must(common.Close(link.Writer))
 		}
-		pipe.CloseError(link.Reader)
+		common.Interrupt(link.Reader)
 	}
+}
+
+// Address implements internet.Dialer.
+func (h *Handler) Address() net.Address {
+	if h.senderSettings == nil || h.senderSettings.Via == nil {
+		return nil
+	}
+	return h.senderSettings.Via.AsAddress()
 }
 
 // Dial implements internet.Dialer.
@@ -130,7 +138,7 @@ func (h *Handler) Dial(ctx context.Context, dest net.Destination) (internet.Conn
 				uplinkReader, uplinkWriter := pipe.New(opts...)
 				downlinkReader, downlinkWriter := pipe.New(opts...)
 
-				go handler.Dispatch(ctx, &vio.Link{Reader: uplinkReader, Writer: downlinkWriter})
+				go handler.Dispatch(ctx, &transport.Link{Reader: uplinkReader, Writer: downlinkWriter})
 				return net.NewConnection(net.ConnectionInputMulti(uplinkWriter), net.ConnectionOutputMulti(downlinkReader)), nil
 			}
 
@@ -145,11 +153,9 @@ func (h *Handler) Dial(ctx context.Context, dest net.Destination) (internet.Conn
 			}
 			outbound.Gateway = h.senderSettings.Via.AsAddress()
 		}
-
-		ctx = internet.ContextWithStreamSettings(ctx, h.streamSettings)
 	}
 
-	return internet.Dial(ctx, dest)
+	return internet.Dial(ctx, dest, h.streamSettings)
 }
 
 // GetOutbound implements proxy.GetOutbound.

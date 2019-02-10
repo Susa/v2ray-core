@@ -14,8 +14,8 @@ import (
 	"v2ray.com/core/common/session"
 	"v2ray.com/core/common/signal/done"
 	"v2ray.com/core/common/task"
-	"v2ray.com/core/common/vio"
 	"v2ray.com/core/proxy"
+	"v2ray.com/core/transport"
 	"v2ray.com/core/transport/internet"
 	"v2ray.com/core/transport/pipe"
 )
@@ -24,8 +24,8 @@ type ClientManager struct {
 	Picker WorkerPicker
 }
 
-func (m *ClientManager) Dispatch(ctx context.Context, link *vio.Link) error {
-	for {
+func (m *ClientManager) Dispatch(ctx context.Context, link *transport.Link) error {
+	for i := 0; i < 16; i++ {
 		worker, err := m.Picker.PickAvailable()
 		if err != nil {
 			return err
@@ -34,6 +34,8 @@ func (m *ClientManager) Dispatch(ctx context.Context, link *vio.Link) error {
 			return nil
 		}
 	}
+
+	return newError("unable to find an available mux client").AtWarning()
 }
 
 type WorkerPicker interface {
@@ -114,7 +116,7 @@ func (p *IncrementalWorkerPicker) pickInternal() (*ClientWorker, error, bool) {
 func (p *IncrementalWorkerPicker) PickAvailable() (*ClientWorker, error) {
 	worker, err, start := p.pickInternal()
 	if start {
-		p.cleanupTask.Start()
+		common.Must(p.cleanupTask.Start())
 	}
 
 	return worker, err
@@ -135,7 +137,7 @@ func (f *DialingWorkerFactory) Create() (*ClientWorker, error) {
 	uplinkReader, upLinkWriter := pipe.New(opts...)
 	downlinkReader, downlinkWriter := pipe.New(opts...)
 
-	c, err := NewClientWorker(vio.Link{
+	c, err := NewClientWorker(transport.Link{
 		Reader: downlinkReader,
 		Writer: upLinkWriter,
 	}, f.Strategy)
@@ -150,7 +152,7 @@ func (f *DialingWorkerFactory) Create() (*ClientWorker, error) {
 		})
 		ctx, cancel := context.WithCancel(ctx)
 
-		if err := p.Process(ctx, &vio.Link{Reader: uplinkReader, Writer: downlinkWriter}, d); err != nil {
+		if err := p.Process(ctx, &transport.Link{Reader: uplinkReader, Writer: downlinkWriter}, d); err != nil {
 			errors.New("failed to handler mux client connection").Base(err).WriteToLog()
 		}
 		common.Must(c.Close())
@@ -167,7 +169,7 @@ type ClientStrategy struct {
 
 type ClientWorker struct {
 	sessionManager *SessionManager
-	link           vio.Link
+	link           transport.Link
 	done           *done.Instance
 	strategy       ClientStrategy
 }
@@ -176,7 +178,7 @@ var muxCoolAddress = net.DomainAddress("v1.mux.cool")
 var muxCoolPort = net.Port(9527)
 
 // NewClientWorker creates a new mux.Client.
-func NewClientWorker(stream vio.Link, s ClientStrategy) (*ClientWorker, error) {
+func NewClientWorker(stream transport.Link, s ClientStrategy) (*ClientWorker, error) {
 	c := &ClientWorker{
 		sessionManager: NewSessionManager(),
 		link:           stream,
@@ -211,8 +213,8 @@ func (m *ClientWorker) monitor() {
 		select {
 		case <-m.done.Wait():
 			m.sessionManager.Close()
-			common.Close(m.link.Writer)    // nolint: errcheck
-			pipe.CloseError(m.link.Reader) // nolint: errcheck
+			common.Close(m.link.Writer)     // nolint: errcheck
+			common.Interrupt(m.link.Reader) // nolint: errcheck
 			return
 		case <-timer.C:
 			size := m.sessionManager.Size()
@@ -251,14 +253,14 @@ func fetchInput(ctx context.Context, s *Session, output buf.Writer) {
 	if err := writeFirstPayload(s.input, writer); err != nil {
 		newError("failed to write first payload").Base(err).WriteToLog(session.ExportIDToError(ctx))
 		writer.hasError = true
-		pipe.CloseError(s.input)
+		common.Interrupt(s.input)
 		return
 	}
 
 	if err := buf.Copy(s.input, writer); err != nil {
 		newError("failed to fetch all input").Base(err).WriteToLog(session.ExportIDToError(ctx))
 		writer.hasError = true
-		pipe.CloseError(s.input)
+		common.Interrupt(s.input)
 		return
 	}
 }
@@ -272,7 +274,7 @@ func (m *ClientWorker) IsClosing() bool {
 }
 
 func (m *ClientWorker) IsFull() bool {
-	if m.IsClosing() {
+	if m.IsClosing() || m.Closed() {
 		return true
 	}
 
@@ -283,7 +285,7 @@ func (m *ClientWorker) IsFull() bool {
 	return false
 }
 
-func (m *ClientWorker) Dispatch(ctx context.Context, link *vio.Link) bool {
+func (m *ClientWorker) Dispatch(ctx context.Context, link *transport.Link) bool {
 	if m.IsFull() || m.Closed() {
 		return false
 	}
@@ -320,6 +322,10 @@ func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 
 	s, found := m.sessionManager.Get(meta.SessionID)
 	if !found {
+		// Notify remote peer to close this session.
+		closingWriter := NewResponseWriter(meta.SessionID, m.link.Writer, protocol.TransferTypeStream)
+		closingWriter.Close()
+
 		return buf.Copy(NewStreamReader(reader), buf.Discard)
 	}
 
@@ -328,8 +334,12 @@ func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 	if err != nil && buf.IsWriteError(err) {
 		newError("failed to write to downstream. closing session ", s.ID).Base(err).WriteToLog()
 
+		// Notify remote peer to close this session.
+		closingWriter := NewResponseWriter(meta.SessionID, m.link.Writer, protocol.TransferTypeStream)
+		closingWriter.Close()
+
 		drainErr := buf.Copy(rr, buf.Discard)
-		pipe.CloseError(s.input)
+		common.Interrupt(s.input)
 		s.Close()
 		return drainErr
 	}
@@ -340,8 +350,8 @@ func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 func (m *ClientWorker) handleStatusEnd(meta *FrameMetadata, reader *buf.BufferedReader) error {
 	if s, found := m.sessionManager.Get(meta.SessionID); found {
 		if meta.Option.Has(OptionError) {
-			pipe.CloseError(s.input)
-			pipe.CloseError(s.output)
+			common.Interrupt(s.input)
+			common.Interrupt(s.output)
 		}
 		s.Close()
 	}

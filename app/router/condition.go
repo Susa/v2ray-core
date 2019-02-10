@@ -1,3 +1,5 @@
+// +build !confonly
+
 package router
 
 import (
@@ -36,31 +38,6 @@ func (v *ConditionChan) Apply(ctx context.Context) bool {
 }
 
 func (v *ConditionChan) Len() int {
-	return len(*v)
-}
-
-type AnyCondition []Condition
-
-func NewAnyCondition() *AnyCondition {
-	var anyCond AnyCondition = make([]Condition, 0, 8)
-	return &anyCond
-}
-
-func (v *AnyCondition) Add(cond Condition) *AnyCondition {
-	*v = append(*v, cond)
-	return v
-}
-
-func (v *AnyCondition) Apply(ctx context.Context) bool {
-	for _, cond := range *v {
-		if cond.Apply(ctx) {
-			return true
-		}
-	}
-	return false
-}
-
-func (v *AnyCondition) Len() int {
 	return len(*v)
 }
 
@@ -120,22 +97,6 @@ func (m *DomainMatcher) Apply(ctx context.Context) bool {
 	return m.ApplyDomain(dest.Address.Domain())
 }
 
-type CIDRMatcher struct {
-	cidr     *net.IPNet
-	onSource bool
-}
-
-func NewCIDRMatcher(ip []byte, mask uint32, onSource bool) (*CIDRMatcher, error) {
-	cidr := &net.IPNet{
-		IP:   net.IP(ip),
-		Mask: net.CIDRMask(int(mask), len(ip)*8),
-	}
-	return &CIDRMatcher{
-		cidr:     cidr,
-		onSource: onSource,
-	}, nil
-}
-
 func sourceFromContext(ctx context.Context) net.Destination {
 	inbound := session.InboundFromContext(ctx)
 	if inbound == nil {
@@ -152,75 +113,65 @@ func targetFromContent(ctx context.Context) net.Destination {
 	return outbound.Target
 }
 
-func (v *CIDRMatcher) Apply(ctx context.Context) bool {
-	ips := make([]net.IP, 0, 4)
-	if resolver, ok := ResolvedIPsFromContext(ctx); ok {
-		resolvedIPs := resolver.Resolve()
-		for _, rip := range resolvedIPs {
-			if !rip.Family().IsIPv6() {
-				continue
-			}
-			ips = append(ips, rip.IP())
+func resolvedIPFromContext(ctx context.Context) []net.IP {
+	outbound := session.OutboundFromContext(ctx)
+	if outbound == nil {
+		return nil
+	}
+	return outbound.ResolvedIPs
+}
+
+type MultiGeoIPMatcher struct {
+	matchers       []*GeoIPMatcher
+	destFunc       func(context.Context) net.Destination
+	resolvedIPFunc func(context.Context) []net.IP
+}
+
+func NewMultiGeoIPMatcher(geoips []*GeoIP, onSource bool) (*MultiGeoIPMatcher, error) {
+	var matchers []*GeoIPMatcher
+	for _, geoip := range geoips {
+		matcher, err := globalGeoIPContainer.Add(geoip)
+		if err != nil {
+			return nil, err
 		}
+		matchers = append(matchers, matcher)
 	}
 
-	var dest net.Destination
-	if v.onSource {
-		dest = sourceFromContext(ctx)
+	matcher := &MultiGeoIPMatcher{
+		matchers: matchers,
+	}
+
+	if onSource {
+		matcher.destFunc = sourceFromContext
 	} else {
-		dest = targetFromContent(ctx)
+		matcher.destFunc = targetFromContent
+		matcher.resolvedIPFunc = resolvedIPFromContext
 	}
 
-	if dest.IsValid() && dest.Address.Family().IsIPv6() {
+	return matcher, nil
+}
+
+func (m *MultiGeoIPMatcher) Apply(ctx context.Context) bool {
+	ips := make([]net.IP, 0, 4)
+
+	dest := m.destFunc(ctx)
+
+	if dest.IsValid() && dest.Address.Family().IsIP() {
 		ips = append(ips, dest.Address.IP())
 	}
 
-	for _, ip := range ips {
-		if v.cidr.Contains(ip) {
-			return true
+	if m.resolvedIPFunc != nil {
+		rips := m.resolvedIPFunc(ctx)
+		if len(rips) > 0 {
+			ips = append(ips, rips...)
 		}
 	}
-	return false
-}
 
-type IPv4Matcher struct {
-	ipv4net  *net.IPNetTable
-	onSource bool
-}
-
-func NewIPv4Matcher(ipnet *net.IPNetTable, onSource bool) *IPv4Matcher {
-	return &IPv4Matcher{
-		ipv4net:  ipnet,
-		onSource: onSource,
-	}
-}
-
-func (v *IPv4Matcher) Apply(ctx context.Context) bool {
-	ips := make([]net.IP, 0, 4)
-	if resolver, ok := ResolvedIPsFromContext(ctx); ok {
-		resolvedIPs := resolver.Resolve()
-		for _, rip := range resolvedIPs {
-			if !rip.Family().IsIPv4() {
-				continue
+	for _, ip := range ips {
+		for _, matcher := range m.matchers {
+			if matcher.Match(ip) {
+				return true
 			}
-			ips = append(ips, rip.IP())
-		}
-	}
-
-	var dest net.Destination
-	if v.onSource {
-		dest = sourceFromContext(ctx)
-	} else {
-		dest = targetFromContent(ctx)
-	}
-
-	if dest.IsValid() && dest.Address.Family().IsIPv4() {
-		ips = append(ips, dest.Address.IP())
-	}
-
-	for _, ip := range ips {
-		if v.ipv4net.Contains(ip) {
-			return true
 		}
 	}
 	return false
@@ -245,21 +196,23 @@ func (v *PortMatcher) Apply(ctx context.Context) bool {
 }
 
 type NetworkMatcher struct {
-	network *net.NetworkList
+	list [8]bool
 }
 
-func NewNetworkMatcher(network *net.NetworkList) *NetworkMatcher {
-	return &NetworkMatcher{
-		network: network,
+func NewNetworkMatcher(network []net.Network) NetworkMatcher {
+	var matcher NetworkMatcher
+	for _, n := range network {
+		matcher.list[int(n)] = true
 	}
+	return matcher
 }
 
-func (v *NetworkMatcher) Apply(ctx context.Context) bool {
+func (v NetworkMatcher) Apply(ctx context.Context) bool {
 	outbound := session.OutboundFromContext(ctx)
 	if outbound == nil || !outbound.Target.IsValid() {
 		return false
 	}
-	return v.network.HasNetwork(outbound.Target.Network)
+	return v.list[int(outbound.Target.Network)]
 }
 
 type UserMatcher struct {
